@@ -1,6 +1,10 @@
 from PyQt6.QtWidgets import QTableWidget, QTextEdit, QWidget, QApplication
 from PyQt6.QtCore import Qt, pyqtSignal
-from PyQt6.QtGui import QFont, QWheelEvent, QKeyEvent, QTextCursor
+import sys
+from PyQt6.QtGui import QFontDatabase, QWheelEvent, QKeyEvent, QTextCursor
+
+# On macOS Qt swaps the keys: the physical Ctrl key is reported as MetaModifier.
+TERM_CTRL = Qt.KeyboardModifier.MetaModifier if sys.platform == "darwin" else Qt.KeyboardModifier.ControlModifier
 
 class DeselectableTableWidget(QTableWidget):
     def mousePressEvent(self, event):
@@ -34,7 +38,9 @@ class ZoomableConsole(QTextEdit):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.default_font_size = 10
-        self.setFont(QFont("Consolas, Courier New, monospace", self.default_font_size))
+        font = QFontDatabase.systemFont(QFontDatabase.SystemFont.FixedFont)
+        font.setPointSize(self.default_font_size)
+        self.setFont(font)
 
     def wheelEvent(self, event: QWheelEvent):
         if event.modifiers() == Qt.KeyboardModifier.ControlModifier:
@@ -61,29 +67,44 @@ class TerminalConsole(ZoomableConsole):
         self.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse | Qt.TextInteractionFlag.TextSelectableByKeyboard)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.manual_input_enabled = True
+        self._pending_cr = ""
 
     def focusNextPrevChild(self, next):
         return False
 
     def insert_terminal_text(self, text: str):
+        # A trailing '\r' may be the first half of a '\r\n' split across chunks;
+        # hold it back so it doesn't wipe the current line.
+        text = self._pending_cr + text
+        self._pending_cr = ""
+        if text.endswith('\r'):
+            text = text[:-1]
+            self._pending_cr = '\r'
+        text = text.replace('\r\n', '\n')
+
         cursor = self.textCursor()
         cursor.movePosition(QTextCursor.MoveOperation.End)
         i = 0
-        while i < len(text):
-            if text[i:i+3] in ('\x08 \x08', '\b \b'):
+        n = len(text)
+        while i < n:
+            ch = text[i]
+            if text.startswith('\x08 \x08', i):
                 cursor.deletePreviousChar()
                 i += 3
-            elif text[i] in ('\x08', '\b'):
+            elif ch == '\x08':
                 cursor.deletePreviousChar()
                 i += 1
-            elif text[i] == '\r':
+            elif ch == '\r':
                 cursor.movePosition(QTextCursor.MoveOperation.StartOfLine)
                 cursor.movePosition(QTextCursor.MoveOperation.EndOfLine, QTextCursor.MoveMode.KeepAnchor)
                 cursor.removeSelectedText()
                 i += 1
             else:
-                cursor.insertText(text[i])
-                i += 1
+                j = i
+                while j < n and text[j] not in '\x08\r':
+                    j += 1
+                cursor.insertText(text[i:j])
+                i = j
         self.setTextCursor(cursor)
         self.ensureCursorVisible()
 
@@ -143,11 +164,11 @@ class TerminalConsole(ZoomableConsole):
             payload = b'\x1b[F'
         elif key == Qt.Key.Key_Delete:
             payload = b'\x1b[3~'
-        elif event.modifiers() & Qt.KeyboardModifier.ControlModifier:
+        elif event.modifiers() & TERM_CTRL:
             if key == Qt.Key.Key_BracketRight:
                 payload = b'\x1d'
             elif Qt.Key.Key_A <= key <= Qt.Key.Key_Z:
-                payload = bytes([key - Qt.Key.Key_A + 1])
+                payload = bytes([int(key) - int(Qt.Key.Key_A) + 1])
         else:
             txt = event.text()
             if txt:

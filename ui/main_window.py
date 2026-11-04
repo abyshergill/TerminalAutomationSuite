@@ -1,4 +1,5 @@
 import csv
+import os
 import time
 from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
@@ -21,7 +22,7 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle(APP_TITLE)
-        self.setWindowIcon(QIcon("icon.svg"))
+        self.setWindowIcon(QIcon(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "icon.svg")))
         self.resize(1380, 850)
 
         self.ssh_host = DEFAULT_HOST
@@ -346,9 +347,13 @@ class MainWindow(QMainWindow):
             stop_on_failure=self.chk_stop_on_fail.isChecked()
         )
         self.runner_thread.log_c1.connect(self.append_c1)
-        self.runner_thread.status_update.connect(lambda row, stat: self.table.setItem(row, 3, QTableWidgetItem(stat)))
+        self.runner_thread.status_update.connect(self.on_status_update)
         self.runner_thread.sequence_finished.connect(self.on_sequence_finished)
         self.runner_thread.start()
+
+    def on_status_update(self, row: int, stat: str):
+        if 0 <= row < self.table.rowCount():
+            self.table.setItem(row, 3, QTableWidgetItem(stat))
 
     def stop_sequence(self):
         if self.runner_thread and self.runner_thread.isRunning():
@@ -375,26 +380,43 @@ class MainWindow(QMainWindow):
     def load_csv(self):
         path, _ = QFileDialog.getOpenFileName(self, "Open Template", "", "CSV Files (*.csv)")
         if path:
+            try:
+                with open(path, 'r', newline='', encoding='utf-8-sig', errors='replace') as f:
+                    rows = list(csv.reader(f))
+            except OSError as e:
+                QMessageBox.critical(self, "Load CSV", f"Could not read file:\n{e}")
+                return
             self.table.setRowCount(0)
-            with open(path, 'r', newline='', encoding='utf-8') as f:
-                for row_data in csv.reader(f):
-                    if not row_data:
-                        continue
-                    pos = self.table.rowCount()
-                    self.table.insertRow(pos)
-                    for col, val in enumerate(row_data[:4]):
-                        self.table.setItem(pos, col, QTableWidgetItem(val))
+            for row_data in rows:
+                if not row_data:
+                    continue
+                if row_data[0].strip().lower() in ("command", "cmd"):
+                    continue  # header row
+                pos = self.table.rowCount()
+                self.table.insertRow(pos)
+                for col, val in enumerate(row_data[:3]):
+                    self.table.setItem(pos, col, QTableWidgetItem(val))
+                self.table.setItem(pos, 3, QTableWidgetItem("Ready"))
 
     def save_csv(self):
         path, _ = QFileDialog.getSaveFileName(self, "Save Template", "", "CSV Files (*.csv)")
         if path:
-            with open(path, 'w', newline='', encoding='utf-8') as f:
-                writer = csv.writer(f)
-                for r in range(self.table.rowCount()):
-                    writer.writerow([self.table.item(r, c).text() if self.table.item(r, c) else "" for c in range(self.table.columnCount())])
+            if not path.lower().endswith(".csv"):
+                path += ".csv"
+            try:
+                with open(path, 'w', newline='', encoding='utf-8') as f:
+                    writer = csv.writer(f)
+                    # Status column is runtime state, not part of the template.
+                    for r in range(self.table.rowCount()):
+                        writer.writerow([self.table.item(r, c).text() if self.table.item(r, c) else "" for c in range(3)])
+            except OSError as e:
+                QMessageBox.critical(self, "Save CSV", f"Could not write file:\n{e}")
 
     def closeEvent(self, event):
-        self.disconnect_ssh()
+        if self.runner_thread and self.runner_thread.isRunning():
+            self.runner_thread.stop()
+            self.runner_thread.wait(3000)
+        self.ssh_manager.disconnect_ssh(notify=False)
         self.logger_c1.stop()
         self.logger_c2.stop()
         super().closeEvent(event)

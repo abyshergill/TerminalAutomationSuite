@@ -33,9 +33,16 @@ class SSHDialog(QDialog):
         self.btn_cancel.clicked.connect(self.reject)
 
     def get_details(self) -> tuple[str, int, str, str]:
+        port_text = self.txt_port.text().strip()
+        try:
+            port = int(port_text) if port_text else 22
+            if not 1 <= port <= 65535:
+                port = 22
+        except ValueError:
+            port = 22
         return (
             self.txt_host.text().strip(),
-            int(self.txt_port.text().strip() or "22"),
+            port,
             self.txt_user.text().strip(),
             self.txt_pass.text()
         )

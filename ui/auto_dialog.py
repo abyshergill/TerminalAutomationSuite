@@ -100,7 +100,10 @@ class AutoBatchWorker(QThread):
                         if r[0].strip().lower() in ("command", "cmd"):
                             continue  # Skip table header row
                         cmd = r[0] if len(r) > 0 else ""
-                        t_out = float(r[1]) if len(r) > 1 and r[1].strip() else 10.0
+                        try:
+                            t_out = float(r[1]) if len(r) > 1 and r[1].strip() else 10.0
+                        except ValueError:
+                            t_out = 10.0
                         exp = r[2] if len(r) > 2 else ""
                         commands.append((cmd, t_out, exp))
             except Exception as e:
@@ -137,8 +140,16 @@ class AutoBatchWorker(QThread):
                     break
 
                 if expect_str.strip():
+                    try:
+                        regex = re.compile(expect_str, re.IGNORECASE)
+                    except re.error as e:
+                        c1_log_entries.append(f"{ts} : [ERROR] : Invalid regex '{expect_str}': {e} ---> FAIL")
+                        file_passed = False
+                        if self.stop_on_fail:
+                            break
+                        continue
+
                     step_start = time.time()
-                    regex = re.compile(expect_str, re.IGNORECASE)
                     matched = False
 
                     while (time.time() - step_start) < timeout:
@@ -148,6 +159,11 @@ class AutoBatchWorker(QThread):
                             matched = True
                             break
                         time.sleep(0.05)
+
+                    if not matched and not self.is_running:
+                        c1_log_entries.append(f"{time.strftime('%Y-%m-%d %H:%M:%S')} : [WARNING] : Stopped by user while waiting for '{expect_str}'")
+                        file_passed = False
+                        break
 
                     ts_res = time.strftime('%Y-%m-%d %H:%M:%S')
                     if matched:
@@ -287,16 +303,20 @@ class AutoRunnerDialog(QDialog):
 
     def handle_worker_data(self, text):
         if self.worker and self.worker.isRunning():
-            self.worker.append_terminal_data(text)
+            # Strip ANSI sequences so regexes like '\$' match the visible prompt.
+            cleaned, _ = clean_terminal_output(text)
+            if cleaned:
+                self.worker.append_terminal_data(cleaned)
 
     def toggle_start_stop(self):
         if self.worker and self.worker.isRunning():
+            # Keep the button locked until the worker really exits, so a new
+            # batch can't start while the old one is still sending commands.
             self.worker.stop()
-            self.btn_start_stop.setText("Start")
-            self.btn_start_stop.setStyleSheet("background-color: #2ea44f; color: white; font-weight: bold; padding: 6px 16px;")
+            self.btn_start_stop.setEnabled(False)
             self.btn_pause.setEnabled(False)
             self.btn_pause.setText("Pause")
-            self.lbl_overall.setText("Stopped by user")
+            self.lbl_overall.setText("Stopping...")
         else:
             if not self.file_paths:
                 QMessageBox.warning(self, "Warning", "Please add at least one CSV template file.")
@@ -366,8 +386,12 @@ class AutoRunnerDialog(QDialog):
         self.table.setItem(row, 2, QTableWidgetItem(elapsed))
 
         # Save Output Files
-        log_dir = self.txt_log_dir.text().strip()
-        os.makedirs(log_dir, exist_ok=True)
+        log_dir = self.txt_log_dir.text().strip() or "test_logs"
+        try:
+            os.makedirs(log_dir, exist_ok=True)
+        except OSError as e:
+            self.lbl_overall.setText(f"Cannot create log folder: {e}")
+            return
         raw_name = os.path.splitext(os.path.basename(self.file_paths[row]))[0]
 
         # Target file names dynamically appended with pass/fail status
@@ -375,26 +399,34 @@ class AutoRunnerDialog(QDialog):
         c1_filename = os.path.join(log_dir, f"{raw_name}_console_1_{stat_tag}.txt")
         c2_filename = os.path.join(log_dir, f"{raw_name}_console_2_{stat_tag}.txt")
 
-        # Write Console 1 Log
-        with open(c1_filename, "w", encoding="utf-8") as f1:
-            f1.write(c1_log if c1_log.strip() else f"Execution finished with status: {status}\n")
+        try:
+            # Write Console 1 Log
+            with open(c1_filename, "w", encoding="utf-8") as f1:
+                f1.write(c1_log if c1_log.strip() else f"Execution finished with status: {status}\n")
 
-        # Write Console 2 Log
-        with open(c2_filename, "w", encoding="utf-8") as f2:
-            cleaned_c2, _ = clean_terminal_output(c2_log)
-            terminal_content = cleaned_c2 if cleaned_c2.strip() else (c2_log if c2_log.strip() else "[No terminal output captured for this sequence]")
-            f2.write(terminal_content)
+            # Write Console 2 Log (already ANSI-cleaned as it was captured)
+            with open(c2_filename, "w", encoding="utf-8") as f2:
+                f2.write(c2_log if c2_log.strip() else "[No terminal output captured for this sequence]")
+        except OSError as e:
+            self.lbl_overall.setText(f"Could not write logs: {e}")
 
     def on_batch_finished(self):
+        stopped = bool(self.worker and not self.worker.is_running)
+        self.btn_start_stop.setEnabled(True)
         self.btn_start_stop.setText("Start")
         self.btn_start_stop.setStyleSheet("background-color: #2ea44f; color: white; font-weight: bold; padding: 6px 16px;")
         self.btn_pause.setEnabled(False)
         self.btn_pause.setText("Pause")
         self.btn_pause.setStyleSheet("")
-        self.lbl_overall.setText("Batch Completed")
+        self.lbl_overall.setText("Stopped by user" if stopped else "Batch Completed")
 
-    def closeEvent(self, event):
+    def done(self, result):
+        # done() runs for close button, Esc and window-close alike (closeEvent does not).
         if self.worker and self.worker.isRunning():
             self.worker.stop()
             self.worker.wait()
-        super().closeEvent(event)
+        try:
+            self.ssh_manager.data_received.disconnect(self.handle_worker_data)
+        except (TypeError, RuntimeError):
+            pass
+        super().done(result)
